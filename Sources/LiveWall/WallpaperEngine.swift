@@ -41,7 +41,7 @@ final class WallpaperEngine: NSObject {
     private var player: AVQueuePlayer?
     private var looper: AVPlayerLooper?
     private var windows: [WallpaperWindow] = []
-    private let menuBar = MenuBarBlurDriver()
+    private let menuBar = MenuBarWallpaperDriver()
 
     /// User pressed pause in the menu.
     private var userPaused = false
@@ -98,19 +98,20 @@ final class WallpaperEngine: NSObject {
     }
 
     func stop() {
+        // Settle the desktop on a still while the player is still alive, then tear down.
+        menuBar.setEnabled(false)
+        menuBar.setVideo(asset: nil, player: nil)
         player?.pause()
         looper = nil
         player = nil
-        menuBar.setActive(false)
-        menuBar.setVideo(asset: nil, player: nil)
         windows.forEach { $0.orderOut(nil) }
         windows = []
         Settings.shared.videoURL = nil
         onStateChange?()
     }
 
-    /// Restore the system desktop picture before the app exits.
-    func prepareForTermination() { menuBar.restoreNow() }
+    /// Leave a still frame of the video as the desktop picture before the app exits.
+    func prepareForTermination() { menuBar.settleNow() }
 
     // MARK: - Playback control
 
@@ -139,7 +140,7 @@ final class WallpaperEngine: NSObject {
 
     private func applyPlaybackState() {
         guard let player else {
-            menuBar.setActive(false)
+            menuBar.setEnabled(false)
             return
         }
         let shouldPlay = !userPaused && systemPauseReasons.isEmpty
@@ -148,8 +149,10 @@ final class WallpaperEngine: NSObject {
         } else {
             if player.rate != 0 { player.pause() }
         }
-        // Only paint the menu bar while the video is actually moving.
-        menuBar.setActive(shouldPlay && Settings.shared.menuBarWallpaper)
+        // The menu bar mirrors the wallpaper while the feature is on; the frame
+        // pump only runs while the video moves (paused holds the last frame).
+        menuBar.setPlaying(shouldPlay)
+        menuBar.setEnabled(Settings.shared.menuBarWallpaper)
         onStateChange?()
     }
 

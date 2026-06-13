@@ -22,7 +22,7 @@ final class Settings {
             Key.muted: true,
             Key.pauseWhenHidden: true,
             Key.pauseOnLowPower: true,
-            Key.menuBarWallpaper: false,
+            Key.menuBarWallpaper: true,
             Key.gravity: AVLayerVideoGravity.resizeAspectFill.rawValue,
         ])
     }
@@ -64,7 +64,8 @@ final class Settings {
     }
 
     /// When on, live video frames are fed to the system desktop picture so the
-    /// menu bar's native translucency samples them (a blurred, readable look).
+    /// menu bar samples them — making the bar a continuation of the wallpaper.
+    /// When off (or on quit) LiveWall leaves a static still of the video instead.
     var menuBarWallpaper: Bool {
         get { d.bool(forKey: Key.menuBarWallpaper) }
         set { d.set(newValue, forKey: Key.menuBarWallpaper) }
