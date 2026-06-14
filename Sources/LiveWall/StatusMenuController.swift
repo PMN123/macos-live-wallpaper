@@ -16,13 +16,30 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         super.init()
 
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "sparkles.tv", accessibilityDescription: "LiveWall")
+            configureStatusBarButton(button)
         }
         menu.delegate = self
         statusItem.menu = menu
         engine.onStateChange = { [weak self] in self?.rebuildMenu() }
         rebuildMenu()
     }
+
+    /// Picks the first SF Symbol that exists on this OS, marks it template (required
+    /// for menu-bar contrast), and falls back to a text glyph if none load.
+    private func configureStatusBarButton(_ button: NSStatusBarButton) {
+        let candidates = ["sparkles.tv", "tv", "sparkles", "play.rectangle"]
+        for name in candidates {
+            if let image = NSImage(systemSymbolName: name, accessibilityDescription: "LiveWall") {
+                image.isTemplate = true
+                button.image = image
+                return
+            }
+        }
+        button.title = "✦"
+    }
+
+    /// Opens the Video Library window — used on first launch and from the menu.
+    func showLibrary() { libraryWC.show() }
 
     // MARK: - Menu construction
 
@@ -45,7 +62,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             menu.addItem(playPause)
         }
 
-        let library = NSMenuItem(title: "Video Library…", action: #selector(showLibrary), keyEquivalent: "l")
+        let library = NSMenuItem(title: "Video Library…", action: #selector(showLibraryFromMenu), keyEquivalent: "l")
         library.target = self
         menu.addItem(library)
 
@@ -133,7 +150,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         }
     }
 
-    @objc private func showLibrary() { libraryWC.show() }
+    @objc private func showLibraryFromMenu() { showLibrary() }
 
     @objc private func openRecent(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }

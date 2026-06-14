@@ -14,6 +14,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 Settings.shared.videoURL = nil
             }
+        } else {
+            // No saved video — open the library so first-time users aren't stuck
+            // behind an invisible menu-bar-only UI.
+            statusMenu.showLibrary()
         }
     }
 
