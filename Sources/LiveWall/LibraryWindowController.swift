@@ -3,8 +3,8 @@ import AVFoundation
 import UniformTypeIdentifiers
 
 /// A small window showing a grid of saved videos. Drop video files anywhere in
-/// it to add them; click one to set it as the wallpaper; hover-click the × to
-/// remove it from the library.
+/// it to add them; click one to set it as the wallpaper; click the × on a tile
+/// to remove it from the library.
 final class LibraryWindowController: NSObject, NSWindowDelegate,
                                      NSCollectionViewDataSource, NSCollectionViewDelegate {
     private let engine: WallpaperEngine
@@ -40,7 +40,11 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
         win.delegate = self
         win.center()
 
-        let container = NSView()
+        let container = VideoDropView()
+        container.onDrop = { [weak self] urls in
+            Settings.shared.addToLibrary(urls)
+            self?.reload()
+        }
 
         // Grid
         let layout = NSCollectionViewFlowLayout()
@@ -153,7 +157,7 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
         }
     }
 
-    private func movieURLs(from info: NSDraggingInfo) -> [URL] {
+    static func movieURLs(from info: NSDraggingInfo) -> [URL] {
         let options: [NSPasteboard.ReadingOptionKey: Any] = [
             .urlReadingFileURLsOnly: true,
             .urlReadingContentsConformToTypes: [UTType.movie.identifier],
@@ -187,12 +191,12 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
     func collectionView(_ collectionView: NSCollectionView, validateDrop draggingInfo: NSDraggingInfo,
                         proposedIndexPath: AutoreleasingUnsafeMutablePointer<NSIndexPath>,
                         dropOperation proposedDropOperation: UnsafeMutablePointer<NSCollectionView.DropOperation>) -> NSDragOperation {
-        movieURLs(from: draggingInfo).isEmpty ? [] : .copy
+        Self.movieURLs(from: draggingInfo).isEmpty ? [] : .copy
     }
 
     func collectionView(_ collectionView: NSCollectionView, acceptDrop draggingInfo: NSDraggingInfo,
                         indexPath: IndexPath, dropOperation: NSCollectionView.DropOperation) -> Bool {
-        let dropped = movieURLs(from: draggingInfo)
+        let dropped = Self.movieURLs(from: draggingInfo)
         guard !dropped.isEmpty else { return false }
         Settings.shared.addToLibrary(dropped)
         reload()
@@ -203,6 +207,30 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
 
     func windowDidBecomeKey(_ notification: Notification) {
         reload() // the wallpaper may have changed via the menu while we were hidden
+    }
+}
+
+/// The window's root view: accepts dropped videos outside the grid too — on the
+/// bottom bar (whose hint says "Drag & drop videos here") and the empty-state text.
+final class VideoDropView: NSView {
+    var onDrop: (([URL]) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        LibraryWindowController.movieURLs(from: sender).isEmpty ? [] : .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = LibraryWindowController.movieURLs(from: sender)
+        guard !urls.isEmpty else { return false }
+        onDrop?(urls)
+        return true
     }
 }
 

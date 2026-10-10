@@ -41,16 +41,26 @@ final class WallpaperEngine: NSObject {
     private var player: AVQueuePlayer?
     private var looper: AVPlayerLooper?
     private var windows: [WallpaperWindow] = []
-    private let menuBar = MenuBarWallpaperDriver()
 
     /// User pressed pause in the menu.
-    private var userPaused = false
+    private(set) var userPaused = false
     /// Set while the system says we shouldn't burn cycles (locked, asleep, hidden, low power).
     private var systemPauseReasons = Set<String>()
 
     var onStateChange: (() -> Void)?
     var hasVideo: Bool { player != nil }
-    var isPlaying: Bool { (player?.rate ?? 0) > 0 }
+
+    private static let pauseReasonNames: [(reason: String, name: String)] = [
+        ("hidden", "Wallpaper Hidden"), ("lowPower", "Low Power Mode"),
+        ("displaySleep", "Display Asleep"), ("locked", "Screen Locked"),
+        ("inactiveSession", "Another User Active"),
+    ]
+
+    /// Why the system is holding playback, for display in the menu; nil when it isn't.
+    var systemPauseDescription: String? {
+        let active = Self.pauseReasonNames.filter { systemPauseReasons.contains($0.reason) }.map(\.name)
+        return active.isEmpty ? nil : active.joined(separator: ", ")
+    }
 
     override init() {
         super.init()
@@ -68,17 +78,30 @@ final class WallpaperEngine: NSObject {
                         name: NSWorkspace.screensDidSleepNotification, object: nil)
         wnc.addObserver(self, selector: #selector(screensDidWake),
                         name: NSWorkspace.screensDidWakeNotification, object: nil)
+        // Fast user switching: don't keep decoding while another user has the screen.
+        wnc.addObserver(self, selector: #selector(sessionResigned),
+                        name: NSWorkspace.sessionDidResignActiveNotification, object: nil)
+        wnc.addObserver(self, selector: #selector(sessionBecameActive),
+                        name: NSWorkspace.sessionDidBecomeActiveNotification, object: nil)
 
         let dnc = DistributedNotificationCenter.default()
         dnc.addObserver(self, selector: #selector(screenLocked),
                         name: Notification.Name("com.apple.screenIsLocked"), object: nil)
         dnc.addObserver(self, selector: #selector(screenUnlocked),
                         name: Notification.Name("com.apple.screenIsUnlocked"), object: nil)
+
+        // The power notification only reports changes, so seed the state at launch.
+        if Settings.shared.pauseOnLowPower && ProcessInfo.processInfo.isLowPowerModeEnabled {
+            systemPauseReasons.insert("lowPower")
+        }
     }
 
     // MARK: - Loading
 
     func load(url: URL) {
+        // Stop the outgoing video explicitly so its audio/decode can't overlap the new one.
+        player?.pause()
+
         let asset = AVURLAsset(url: url)
         let item = AVPlayerItem(asset: asset)
         let newPlayer = AVQueuePlayer()
@@ -87,7 +110,6 @@ final class WallpaperEngine: NSObject {
         newPlayer.actionAtItemEnd = .advance
         looper = AVPlayerLooper(player: newPlayer, templateItem: item)
         player = newPlayer
-        menuBar.setVideo(asset: asset, player: newPlayer)
 
         Settings.shared.videoURL = url
         Settings.shared.addRecent(url)
@@ -98,9 +120,6 @@ final class WallpaperEngine: NSObject {
     }
 
     func stop() {
-        // Settle the desktop on a still while the player is still alive, then tear down.
-        menuBar.setEnabled(false)
-        menuBar.setVideo(asset: nil, player: nil)
         player?.pause()
         looper = nil
         player = nil
@@ -110,13 +129,12 @@ final class WallpaperEngine: NSObject {
         onStateChange?()
     }
 
-    /// Leave a still frame of the video as the desktop picture before the app exits.
-    func prepareForTermination() { menuBar.settleNow() }
-
     // MARK: - Playback control
 
+    /// Flips the user's intent, independent of any system pause — so "Pause" during
+    /// Low Power Mode sticks, and "Play" is never a silent no-op.
     func togglePlayPause() {
-        userPaused = isPlaying
+        userPaused.toggle()
         applyPlaybackState()
     }
 
@@ -132,27 +150,14 @@ final class WallpaperEngine: NSObject {
         }
     }
 
-    /// Toggle whether the wallpaper also drives the menu bar's translucency.
-    func setMenuBarWallpaper(_ on: Bool) {
-        Settings.shared.menuBarWallpaper = on
-        applyPlaybackState()
-    }
-
     private func applyPlaybackState() {
-        guard let player else {
-            menuBar.setEnabled(false)
-            return
-        }
+        guard let player else { return }
         let shouldPlay = !userPaused && systemPauseReasons.isEmpty
         if shouldPlay {
             if player.rate == 0 { player.play() }
         } else {
             if player.rate != 0 { player.pause() }
         }
-        // The menu bar mirrors the wallpaper while the feature is on; the frame
-        // pump only runs while the video moves (paused holds the last frame).
-        menuBar.setPlaying(shouldPlay)
-        menuBar.setEnabled(Settings.shared.menuBarWallpaper)
         onStateChange?()
     }
 
@@ -216,4 +221,6 @@ final class WallpaperEngine: NSObject {
     @objc private func screensDidWake() { setSystemPause("displaySleep", false) }
     @objc private func screenLocked() { setSystemPause("locked", true) }
     @objc private func screenUnlocked() { setSystemPause("locked", false) }
+    @objc private func sessionResigned() { setSystemPause("inactiveSession", true) }
+    @objc private func sessionBecameActive() { setSystemPause("inactiveSession", false) }
 }
