@@ -39,7 +39,7 @@ Everything else (play/pause, mute, scaling, pause options, login item) is in the
 
 ## Notes
 
-- The menu bar keeps the system's own look. macOS only lets the menu bar sample the desktop *picture*, never a window, and on macOS 26 it ignores rapid desktop-picture changes, so an earlier "Wallpaper in Menu Bar" mode was removed (see [issue #1](https://github.com/PMN123/macos-live-wallpaper/issues/1)).
+- On macOS 26 the menu bar has no background by default, so the live wallpaper shows straight through it with no extra work. If you give the menu bar a background in **System Settings ▸ Menu Bar** or turn on **Reduce Transparency**, it covers the video. An earlier "Wallpaper in Menu Bar" mode that pushed video frames into the desktop picture was removed: macOS ignores rapid desktop-picture changes, and the mode overwrote your real wallpaper (see [issue #1](https://github.com/PMN123/macos-live-wallpaper/issues/1)).
 - **Upgrading from 1.0?** Its *Wallpaper in Menu Bar* mode (on by default) replaced your desktop picture with a still frame of the video. LiveWall no longer touches it, so pick your wallpaper again once in **System Settings ▸ Wallpaper**; after that you can delete `~/Library/Application Support/LiveWall/`.
 - The ad-hoc signature is fine for personal use. To distribute, sign with a Developer ID and notarize.
 - Settings persist in `defaults` under `com.praniil.livewall`.
