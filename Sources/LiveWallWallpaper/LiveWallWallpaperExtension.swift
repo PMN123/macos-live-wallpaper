@@ -3,10 +3,11 @@
 // Adapted from Phosphene (https://github.com/kageroumado/phosphene), MIT License, © 2026 kageroumado
 // Source: PhospheneExtension/PhospheneExtension.swift at commit db03edf. See THIRD_PARTY_NOTICES.md.
 //
-// WallpaperAgent spawns this process for the "LiveWall" tile in System Settings >
-// Wallpaper. Each hosted surface plays the video LiveWall publishes in the shared
-// directory (see LiveWallShared), and the extension tells LiveWall when it is the live
-// desktop so the app can close its own wallpaper window.
+// WallpaperAgent spawns this process for the LiveWall tiles in System Settings >
+// Wallpaper. Each hosted surface plays the video its tile names: LiveWall's current
+// video, or one of its Video Library, as LiveWall publishes them in the shared
+// directory (see LiveWallShared). The extension tells LiveWall when it is the live
+// desktop so the app can close its own wallpaper window, and what each desktop plays.
 
 import ExtensionFoundation
 import Foundation
@@ -28,6 +29,7 @@ final class LiveWallWallpaperExtension: NSObject, AppExtension {
                 Lifecycle.queue.async {
                     Liveness.shared.start()
                     SharedStateStore.shared.start()
+                    LibraryStore.shared.start()
                 }
                 // The extension is only ever spawned by a host connection. Push the view
                 // models shortly after launch so the agent's on-disk settings cache can't

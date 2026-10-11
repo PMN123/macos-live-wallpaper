@@ -10,7 +10,12 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     private let systemWallpaper: SystemWallpaperBridge?
     private let statusItem: NSStatusItem
     private let menu = NSMenu()
-    private lazy var libraryWC = LibraryWindowController(engine: engine)
+    private lazy var libraryWC = LibraryWindowController(engine: engine, systemWallpaper: systemWallpaper)
+    /// Shown in the menu until it next closes: a video picked in LiveWall changes no
+    /// desktop, because each uses a fixed library tile (once per launch).
+    private var showFixedTileHint = false
+    /// The open menu shows that hint.
+    private var menuShowsFixedTileHint = false
 
     init(engine: WallpaperEngine, systemWallpaper: SystemWallpaperBridge?) {
         self.engine = engine
@@ -24,7 +29,10 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         engine.addStateObserver { [weak self] in self?.rebuildMenu() }
-        systemWallpaper?.onStatusChange = { [weak self] in self?.rebuildMenu() }
+        systemWallpaper?.onStatusChange = { [weak self] in
+            self?.rebuildMenu()
+            self?.libraryWC.systemWallpaperStatusChanged()
+        }
         rebuildMenu()
     }
 
@@ -48,6 +56,19 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     // MARK: - Menu construction
 
     func menuNeedsUpdate(_ menu: NSMenu) { rebuildMenu() }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuShowsFixedTileHint = showFixedTileHint
+    }
+
+    /// Clears the hint once a menu showing it closes (not the close that comes with the
+    /// pick that armed it).
+    func menuDidClose(_ menu: NSMenu) {
+        guard menuShowsFixedTileHint else { return }
+        menuShowsFixedTileHint = false
+        showFixedTileHint = false
+        rebuildMenu()
+    }
 
     private func rebuildMenu() {
         menu.removeAllItems()
@@ -79,7 +100,8 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         if let systemWallpaper {
             let status: String?
             if systemWallpaper.isExtensionActive {
-                status = "Playing as system wallpaper"
+                status = systemWallpaper.playingSummary.map { "Playing as system wallpaper: \($0)" }
+                    ?? "Playing as system wallpaper"
             } else if engine.isStandingDown {
                 // The extension went quiet; LiveWall's window comes back after a short
                 // grace period unless it reports again.
@@ -93,6 +115,11 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
                 let line = NSMenuItem(title: status, action: nil, keyEquivalent: "")
                 line.isEnabled = false
                 menu.addItem(line)
+            }
+            if showFixedTileHint {
+                let hint = NSMenuItem(title: Self.fixedTileHint, action: nil, keyEquivalent: "")
+                hint.isEnabled = false
+                menu.addItem(hint)
             }
         }
 
@@ -175,6 +202,18 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.addItem(quit)
     }
 
+    /// Why a video picked in LiveWall did not change the desktop.
+    static let fixedTileHint = "Picks here change only the “Current Video” wallpaper tile"
+
+    /// The user picked a video in LiveWall: if no desktop follows LiveWall's pick, say so
+    /// the next time the menu opens (once per launch).
+    private func noteUserPickedVideo() {
+        if systemWallpaper?.shouldHintFixedTiles() == true {
+            showFixedTileHint = true
+            rebuildMenu()
+        }
+    }
+
     /// A checkmark item. With no action it is shown disabled (the menu auto-enables
     /// items, so an action-less item cannot be chosen) but keeps its checkmark.
     private func toggle(_ title: String, _ action: Selector?, on: Bool) -> NSMenuItem {
@@ -196,6 +235,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         if panel.runModal() == .OK, let url = panel.url {
             engine.load(url: url)
+            noteUserPickedVideo()
         }
     }
 
@@ -204,6 +244,7 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     @objc private func openRecent(_ sender: NSMenuItem) {
         guard let url = sender.representedObject as? URL else { return }
         engine.load(url: url)
+        noteUserPickedVideo()
     }
 
     @objc private func togglePlayPause() { engine.togglePlayPause() }

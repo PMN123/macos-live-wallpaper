@@ -10,6 +10,7 @@
 // sharing one context across surfaces blacks out the others (Phosphene commit 420a9f2).
 
 import Foundation
+import LiveWallShared
 import QuartzCore
 
 /// Process-wide serialization for wallpaper lifecycle work. Every connection gets its
@@ -143,10 +144,15 @@ final class HostedSurface {
     var teardown: DispatchWorkItem?
     /// The play state last sent to the renderer.
     var playing = false
+    /// The tile picked for this surface: "current" or a library entry id. Each acquire
+    /// carries it; picking another LiveWall tile re-acquires with the new one.
+    var choice: String
+    /// What the renderer was last told to show for `choice`.
+    var video: SharedVideoResolution
 
     init(wallpaperID: UUID, context: NSObject, contextId: UInt32, rootLayer: CALayer,
          renderer: VideoRenderer, displayID: UInt32?, agent: SurfaceAgentState,
-         destSize: CGSize, scaleFactor: CGFloat) {
+         destSize: CGSize, scaleFactor: CGFloat, choice: String, video: SharedVideoResolution) {
         self.wallpaperID = wallpaperID
         self.context = context
         self.contextId = contextId
@@ -156,6 +162,15 @@ final class HostedSurface {
         self.agent = agent
         self.destSize = destSize
         self.scaleFactor = scaleFactor
+        self.choice = choice
+        self.video = video
+    }
+
+    /// The still to seed or stand in for this surface's video: its library video's
+    /// still, or the Current Video still.
+    @available(macOS 26.0, *)
+    var stillURL: URL {
+        video.entry.flatMap { LibraryStore.shared.thumbnailURL(for: $0) } ?? SharedStateStore.shared.thumbnailURL
     }
 
     var isPreview: Bool {
@@ -215,6 +230,30 @@ final class SurfaceRegistry {
         return surfaces.values.contains { $0.agent.isSelectedDesktop }
     }
 
+    /// A selected desktop plays a video of LiveWall's library (its tile is a library
+    /// video whose clone is readable): that desktop shows what LiveWall published even
+    /// when state.json has no video.
+    var hasSelectedDesktopPlayingLibraryVideo: Bool {
+        dispatchPrecondition(condition: .onQueue(Lifecycle.queue))
+        return surfaces.values.contains { $0.agent.isSelectedDesktop && $0.video.entry != nil }
+    }
+
+    /// The tile in effect and video of each selected desktop, for playing.json: sorted,
+    /// one entry per display and tile (Spaces of a display sharing a tile collapse). A
+    /// tile whose library video is gone or unreadable plays the current video and follows
+    /// LiveWall's picks, so it is reported as the Current Video tile.
+    func playingSurfaces() -> [SharedPlayingSurface] {
+        dispatchPrecondition(condition: .onQueue(Lifecycle.queue))
+        let currentName = SharedStateStore.shared.currentVideoName
+        var result = Set<SharedPlayingSurface>()
+        for surface in surfaces.values where surface.agent.isSelectedDesktop {
+            let name = surface.video.entry?.name ?? (surface.video.url != nil ? currentName : nil)
+            let choice = SharedChoice.inEffect(choice: surface.choice, video: surface.video)
+            result.insert(SharedPlayingSurface(display: surface.displayID ?? 0, choice: choice, videoName: name))
+        }
+        return result.sorted()
+    }
+
     /// The agent state for a surface about to be created (DesktopDisplayMemory).
     func freshAgentState(isPreview: Bool, mode: String, suspended: Bool, displayID: UInt32?) -> SurfaceAgentState {
         dispatchPrecondition(condition: .onQueue(Lifecycle.queue))
@@ -244,26 +283,61 @@ final class SurfaceRegistry {
     func reconcilePlayback(_ surface: HostedSurface) {
         dispatchPrecondition(condition: .onQueue(Lifecycle.queue))
         let store = SharedStateStore.shared
-        let play = surface.agent.shouldPlay(hasVideo: store.videoURL != nil, userPaused: store.isUserPaused)
+        let hasVideo = surface.video.url != nil
+        let play = surface.agent.shouldPlay(hasVideo: hasVideo, userPaused: store.isUserPaused)
         guard play != surface.playing else { return }
         surface.playing = play
         surface.renderer.setPlaying(play)
-        traceLog("  [Surface \(surface.label)] \(play ? "PLAY" : "HOLD") (mode \(surface.agent.mode), suspended \(surface.agent.suspended), user paused \(store.isUserPaused), video \(store.videoURL != nil))")
+        traceLog("  [Surface \(surface.label)] \(play ? "PLAY" : "HOLD") (mode \(surface.agent.mode), suspended \(surface.agent.suspended), user paused \(store.isUserPaused), video \(hasVideo))")
     }
 
-    /// Fan a state.json change out to every surface.
+    /// Fan a state.json change out to every surface. Only surfaces whose video changed
+    /// (the Current Video tile, or a library tile falling back to it) switch.
     func applySharedState(videoChanged: Bool, gravityChanged: Bool) {
         dispatchPrecondition(condition: .onQueue(Lifecycle.queue))
         let store = SharedStateStore.shared
         for surface in surfaces.values {
-            if videoChanged {
-                surface.renderer.load(store.videoURL, synchronously: false)
-            }
             if gravityChanged {
                 surface.renderer.setGravity(store.gravity)
             }
-            reconcilePlayback(surface)
+            if videoChanged {
+                updateVideo(surface)
+            } else {
+                reconcilePlayback(surface)
+            }
         }
+    }
+
+    /// Re-resolve every surface's video (the library or state.json changed); returns
+    /// whether any surface switched.
+    @discardableResult
+    func refreshVideos() -> Bool {
+        dispatchPrecondition(condition: .onQueue(Lifecycle.queue))
+        var switched = false
+        for surface in surfaces.values where updateVideo(surface) {
+            switched = true
+        }
+        return switched
+    }
+
+    /// Resolve `surface`'s video for its tile and, if the file changed, switch in place:
+    /// the renderer keeps the current frame until the new video's first frame replaces
+    /// it, so nothing flashes. Returns whether it switched.
+    @discardableResult
+    func updateVideo(_ surface: HostedSurface) -> Bool {
+        dispatchPrecondition(condition: .onQueue(Lifecycle.queue))
+        let next = LibraryStore.shared.resolve(choice: surface.choice)
+        let switched = next.url != surface.video.url
+        if next.fellBack, !surface.video.fellBack || switched {
+            extensionLog("  [Surface \(surface.label)] tile \(surface.choice) is not in LiveWall's library (or its file is unreadable) → the current video")
+        }
+        surface.video = next
+        if switched {
+            extensionLog("  [Surface \(surface.label)] video → \(next.entry?.name ?? next.url?.lastPathComponent ?? "none") (tile \(surface.choice))")
+            surface.renderer.load(next.url, synchronously: false)
+        }
+        reconcilePlayback(surface)
+        return switched
     }
 
     /// Pause an invalidated surface now and tear it down after the grace period.

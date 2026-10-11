@@ -13,6 +13,12 @@ import os
 ///   directory (SharedWallpaperStore) on every change. Nothing else: LiveWall adds no
 ///   automatic pauses to the system wallpaper. macOS decides when it is drawn, as for
 ///   its own video wallpapers.
+/// - While on, also exports the Video Library (SharedLibraryExporter) at launch and on
+///   every library change, so System Settings offers a tile per video beside the
+///   "Current Video" tile, and reads which tile each desktop plays (playing.json).
+///   While off, a video removed from the library still loses the tile and copy an
+///   earlier export made, but nothing new is copied; turning the mode off stops a
+///   running export.
 /// - Tracks whether LiveWall is the selected system wallpaper (the extension's Darwin
 ///   notifications plus a heartbeat in the notify state; stale after 20 s) and, while
 ///   it is, stands the engine down so the video is decoded once. The extension stays
@@ -39,12 +45,14 @@ final class SystemWallpaperBridge {
         var inactive = SharedWallpaper.Notification.inactive
         var ping = SharedWallpaper.Notification.ping
         var request = SharedWallpaper.Notification.request
+        var playing = SharedWallpaper.Notification.playing
     }
 
     private static let logger = Logger(subsystem: "com.praniil.livewall", category: "system-wallpaper")
 
     private let engine: WallpaperEngine
     private let store: SharedWallpaperStore
+    private let libraryExporter: SharedLibraryExporter
     private let names: Notifications
     /// Wait this long after the extension goes quiet before rebuilding the windows, so
     /// a display reconfigure or a re-pick (brief gaps in liveness) costs nothing.
@@ -56,6 +64,11 @@ final class SystemWallpaperBridge {
     private var activeToken: Int32 = NOTIFY_TOKEN_INVALID
     private var inactiveToken: Int32 = NOTIFY_TOKEN_INVALID
     private var requestToken: Int32 = NOTIFY_TOKEN_INVALID
+    private var playingToken: Int32 = NOTIFY_TOKEN_INVALID
+    private var libraryObserver: NSObjectProtocol?
+    /// playing.json as last read.
+    private var playing: [SharedPlayingSurface] = []
+    private var fixedTileHintShown = false
     private var lastActiveNotification: Date?
     private var lastInactiveNotification: Date?
     private var timer: Timer?
@@ -74,10 +87,13 @@ final class SystemWallpaperBridge {
 
     init(engine: WallpaperEngine,
          store: SharedWallpaperStore? = nil,
+         libraryExporter: SharedLibraryExporter? = nil,
          notifications: Notifications = Notifications(),
          standUpGrace: TimeInterval = SharedWallpaper.heartbeatInterval + 1) {
         self.engine = engine
-        self.store = store ?? SharedWallpaperStore(log: { SystemWallpaperBridge.logger.notice("\($0, privacy: .public)") })
+        let log: (String) -> Void = { SystemWallpaperBridge.logger.notice("\($0, privacy: .public)") }
+        self.store = store ?? SharedWallpaperStore(log: log)
+        self.libraryExporter = libraryExporter ?? SharedLibraryExporter(directory: self.store.directory, log: log)
         self.names = notifications
         self.standUpGrace = standUpGrace
     }
@@ -102,6 +118,15 @@ final class SystemWallpaperBridge {
             // The LiveWall tile is on screen with nothing to show.
             self?.enableSystemWallpaperMode(reason: "the wallpaper extension asked for the video")
         }
+        notify_register_dispatch(names.playing, &playingToken, .main) { [weak self] _ in
+            self?.reloadPlaying()
+        }
+        libraryObserver = NotificationCenter.default.addObserver(
+            forName: Settings.libraryDidChange, object: nil, queue: .main) { [weak self] _ in
+            self?.exportLibrary()
+        }
+        reloadPlaying()
+        exportLibrary()
 
         lastScreenUnavailable = engine.isScreenUnavailable
         engine.addStateObserver { [weak self] in
@@ -130,6 +155,86 @@ final class SystemWallpaperBridge {
             Self.logger.notice("system wallpaper mode on: \(reason, privacy: .public)")
         }
         publishCurrentState(force: true)
+        exportLibrary()
+    }
+
+    /// Export the Video Library while system wallpaper mode is on: one System Settings
+    /// tile per video. Cheap when nothing changed (the exporter only compares files).
+    /// While the mode is off, apply only removals to what an earlier export wrote (a
+    /// removed video must not keep a playable tile, or its copy's disk space); nothing
+    /// is copied, and nothing is written if the mode was never used.
+    private func exportLibrary() {
+        let items = Settings.shared.libraryEntries.map { LibraryExportItem(id: $0.id, source: $0.url) }
+        libraryExporter.export(items, removalsOnly: !Settings.shared.systemWallpaperEnabled)
+    }
+
+    // MARK: - What the system wallpaper plays
+
+    private func reloadPlaying() {
+        let url = store.directory.appendingPathComponent(SharedWallpaper.playingFileName, isDirectory: false)
+        let next = FileManager.default.contents(atPath: url.path).map(SharedPlayingSurface.decode) ?? []
+        guard next != playing else { return }
+        playing = next
+        onStatusChange?()
+    }
+
+    /// The desktops LiveWall is the selected wallpaper of, while it is: their tile and
+    /// video. Empty when the extension reports nothing (or an older one is running).
+    var playingSurfaces: [SharedPlayingSurface] {
+        isExtensionActive ? playing : []
+    }
+
+    /// The video the system wallpaper plays ("Crow Samurai"), or how many when desktops
+    /// differ ("2 videos"); nil when unknown.
+    var playingSummary: String? {
+        var names: [String] = []
+        for surface in playingSurfaces {
+            if let name = surface.videoName, !names.contains(name) { names.append(name) }
+        }
+        switch names.count {
+        case 0: return nil
+        case 1: return names[0]
+        default: return "\(names.count) videos"
+        }
+    }
+
+    /// Paths of the library videos the system wallpaper plays: fixed tiles by their id,
+    /// and LiveWall's current video for every desktop that follows it.
+    func libraryPathsPlayedBySystem() -> Set<String> {
+        let surfaces = playingSurfaces
+        guard !surfaces.isEmpty else { return [] }
+        let byID = Dictionary(Settings.shared.libraryEntries.map { ($0.id, $0.url.path) }, uniquingKeysWith: { first, _ in first })
+        let ids = Set(byID.keys)
+        var paths = Set<String>()
+        for surface in surfaces {
+            if let id = surface.fixedTileID(libraryIDs: ids), let path = byID[id] {
+                paths.insert(path)
+            } else if let path = Settings.shared.videoURL?.path {
+                // The Current Video tile, or a tile whose video left the library: the
+                // extension plays the current video there.
+                paths.insert(path)
+            }
+        }
+        return paths
+    }
+
+    /// Every desktop with LiveWall selected uses a fixed library tile, so a video picked
+    /// in LiveWall changes only the Current Video tile, which no desktop shows. A tile
+    /// whose id is not in the library (the video was removed) follows the current video,
+    /// like the Current Video tile.
+    var everyDesktopUsesFixedTile: Bool {
+        let surfaces = playingSurfaces
+        guard !surfaces.isEmpty else { return false }
+        let ids = Set(Settings.shared.libraryEntries.map(\.id))
+        return surfaces.allSatisfy { $0.fixedTileID(libraryIDs: ids) != nil }
+    }
+
+    /// Call when the user picks a video in LiveWall. True once per launch, when that
+    /// pick changes nothing on the desktop (everyDesktopUsesFixedTile): show the hint.
+    func shouldHintFixedTiles() -> Bool {
+        guard everyDesktopUsesFixedTile, !fixedTileHintShown else { return false }
+        fixedTileHintShown = true
+        return true
     }
 
     /// LiveWall is quitting: the extension keeps playing on its own, with the user's
@@ -193,6 +298,7 @@ final class SystemWallpaperBridge {
         if active != isExtensionActive {
             isExtensionActive = active
             Self.logger.notice("system wallpaper extension \(active ? "active" : "inactive", privacy: .public)")
+            reloadPlaying()
             onStatusChange?()
         }
 
@@ -223,6 +329,7 @@ final class SystemWallpaperBridge {
             // Another wallpaper was picked (or the extension is gone): stop sharing the
             // video until the LiveWall tile is in use again.
             Settings.shared.systemWallpaperEnabled = false
+            self.libraryExporter.cancel()
             Self.logger.notice("system wallpaper mode off")
             self.updatePolling()
         }
@@ -276,12 +383,13 @@ final class SystemWallpaperBridge {
                 }
                 let alert = NSAlert()
                 alert.messageText = "Choose LiveWall in Wallpaper settings"
-                var text = "In System Settings › Wallpaper, pick the “LiveWall” tile, then turn on “Show on all Spaces”. "
-                text += "With more than one display, pick LiveWall for every display: while it plays as the system wallpaper, LiveWall closes its own window on all of them.\n\n"
+                var text = "In System Settings › Wallpaper, find the LiveWall section. Pick “Current Video” to show whatever you pick in LiveWall, or pick one of your Video Library videos to keep that one. Then turn on “Show on all Spaces”. "
+                text += "If your Video Library videos aren’t listed yet, pick “Current Video” once (or quit System Settings and open it again); the list then updates.\n\n"
+                text += "With more than one display, pick a LiveWall tile for every display (each may show a different video): while LiveWall plays as the system wallpaper, it closes its own window on all of them.\n\n"
                 text += "macOS then plays your video as the real wallpaper, including behind the menu bar and on the lock screen, without sound.\n\n"
                 text += "To go back, pick any other wallpaper there."
                 if case .registered = outcome {
-                    text += "\n\nIf the LiveWall tile isn’t listed yet, quit System Settings and open it again."
+                    text += "\n\nIf the LiveWall section isn’t listed yet, quit System Settings and open it again."
                 }
                 if case let .otherCopy(path) = outcome {
                     text += "\n\nmacOS is using the wallpaper extension of another LiveWall copy:\n\(path)\nDelete that copy, or unregister it in Terminal with: pluginkit -r \"\(path)\""

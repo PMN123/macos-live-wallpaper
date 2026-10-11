@@ -56,6 +56,14 @@ final class SharedStateStore {
         directory.appendingPathComponent(SharedWallpaper.thumbnailFileName, isDirectory: false)
     }
 
+    /// Title of the current video (from the name of the file the host cloned), for
+    /// playing.json; nil when there is none.
+    var currentVideoName: String? {
+        guard videoURL != nil else { return nil }
+        guard let source = state.source, !source.isEmpty else { return "LiveWall" }
+        return SharedVideoNames.displayName(forFileName: (source as NSString).lastPathComponent)
+    }
+
     /// A selected desktop shows what LiveWall published: its video, or deliberately nothing
     /// after the user removed the wallpaper in LiveWall. Otherwise (no state.json yet,
     /// the shared directory not readable, the video not readable) it shows only the
@@ -359,14 +367,22 @@ final class Liveness {
         }
     }
 
-    /// Re-derive the status from the surfaces and the shared state. Lifecycle queue.
+    /// A selected desktop can show what LiveWall published: the current video (or its
+    /// deliberate absence), or the library video its tile names.
+    private var canShowPublished: Bool {
+        SharedStateStore.shared.canShowPublishedWallpaper || SurfaceRegistry.shared.hasSelectedDesktopPlayingLibraryVideo
+    }
+
+    /// Re-derive the status from the surfaces and the shared state, and report what each
+    /// desktop plays. Lifecycle queue.
     func recompute() {
         dispatchPrecondition(condition: .onQueue(Lifecycle.queue))
+        defer { PlayingReport.shared.update() }
         let registry = SurfaceRegistry.shared
         registry.rememberSelectedDesktops()
         let selected = registry.hasSelectedDesktopSurface
         let store = SharedStateStore.shared
-        let canShow = store.canShowPublishedWallpaper
+        let canShow = canShowPublished
         let waiting = selected && !canShow
         if waiting != isWaitingForHost {
             isWaitingForHost = waiting
@@ -419,8 +435,7 @@ final class Liveness {
 
     private func goInactiveIfStillIdle() {
         pendingInactive = nil
-        guard state.settle(SurfaceRegistry.shared.agentStates,
-                           canShowPublished: SharedStateStore.shared.canShowPublishedWallpaper) else { return }
+        guard state.settle(SurfaceRegistry.shared.agentStates, canShowPublished: canShowPublished) else { return }
         heartbeat?.cancel()
         heartbeat = nil
         setHeartbeat(0)

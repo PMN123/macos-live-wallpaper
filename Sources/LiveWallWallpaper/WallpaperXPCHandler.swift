@@ -79,9 +79,16 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         extensionLog("=== ACQUIRE (pid \(connectionPID)) === surface \(surfaceUUID.uuidString) display \(displayID.map(String.init) ?? "nil") size \(destSize) @\(scaleFactor)x preview \(isPreview) choice \(choiceConfiguration ?? "nil") mode \(initialMode) activity \(initialActivity)")
         traceLog("  acquire request: \(describeXPCPayload(request))")
 
-        // Pick up a state change whose notification was missed (e.g. while not running).
+        // Pick up a state or library change whose notification was missed (e.g. while
+        // not running).
         let store = SharedStateStore.shared
         store.refresh(reason: "acquire")
+        LibraryStore.shared.refresh(reason: "acquire")
+        // The tile picked for this surface. Picking another LiveWall tile re-acquires the
+        // same WallpaperID with the new choice (Phosphene). Every acquire seen so far,
+        // lock screen included, carries one; a re-acquire without it keeps the tile.
+        let requestedChoice = choiceConfiguration.map { SharedChoice.normalized($0) }
+        let choice = requestedChoice ?? SharedChoice.current
 
         // ---- REUSE: this WallpaperID already has a context ----
         if let existing = registry.surface(for: surfaceUUID) {
@@ -102,6 +109,12 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
                 extensionLog("  REUSE context \(existing.contextId)")
             }
             existing.agent.update(mode: initialMode, suspended: startSuspended)
+            if let choice = requestedChoice, existing.choice != choice {
+                extensionLog("  tile \(existing.choice) → \(choice)")
+                existing.choice = choice
+                // In place: the context keeps its frame until the new video's first one.
+                registry.updateVideo(existing)
+            }
             registry.reconcilePlayback(existing)
             Liveness.shared.noteAgentReport(isPreview: isPreview, mode: initialMode, suspended: startSuspended)
             guard let replyObj = createRemoteContextXPC(contextId: existing.contextId) else {
@@ -131,9 +144,14 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         CATransaction.commit()
         CATransaction.flush()
 
-        // Seed the layer with the tile thumbnail so the very first composite is never
+        // Seed the layer with the tile's still so the very first composite is never
         // empty; the video's first frame replaces it.
-        let seed = loadImage(at: store.thumbnailURL)
+        let video = LibraryStore.shared.resolve(choice: choice)
+        if video.fellBack {
+            extensionLog("  tile \(choice) is not in LiveWall's library (or its file is unreadable) → the current video")
+        }
+        let seedURL = video.entry.flatMap { LibraryStore.shared.thumbnailURL(for: $0) } ?? store.thumbnailURL
+        let seed = loadImage(at: seedURL)
         guard let renderer = VideoRenderer(rootLayer: rootLayer, gravity: store.gravity, seed: seed) else {
             extensionError("  ERROR: renderer creation failed — failing acquire")
             CARemote.invalidate(context)
@@ -148,14 +166,14 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         let surface = HostedSurface(
             wallpaperID: surfaceUUID, context: context, contextId: contextId, rootLayer: rootLayer,
             renderer: renderer, displayID: displayID, agent: agent,
-            destSize: destSize, scaleFactor: scaleFactor
+            destSize: destSize, scaleFactor: scaleFactor, choice: choice, video: video
         )
         registry.install(surface)
         Liveness.shared.noteAgentReport(isPreview: isPreview, mode: initialMode, suspended: startSuspended)
 
         // Up to the first enqueued frame before replying: the agent shows whatever the
         // context holds the moment it hosts it.
-        renderer.load(store.videoURL, synchronously: true)
+        renderer.load(video.url, synchronously: true)
         registry.reconcilePlayback(surface)
 
         guard let replyObj = createRemoteContextXPC(contextId: contextId) else {
@@ -163,7 +181,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
             reply(nil, makeError(3, "Failed to build WallpaperRemoteContextXPC"))
             return
         }
-        extensionLog("  CREATED context \(contextId) renderer #\(renderer.debugID) for \(surface.label) (\(registry.count) surface(s)) video \(store.videoURL?.lastPathComponent ?? "none")")
+        extensionLog("  CREATED context \(contextId) renderer #\(renderer.debugID) for \(surface.label) (\(registry.count) surface(s)) tile \(choice) video \(video.entry?.name ?? video.url?.lastPathComponent ?? "none")")
         reply(replyObj, nil)
         Liveness.shared.recompute()
     }
@@ -235,17 +253,32 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     func snapshot(withId id: Any?, reply: @escaping (Any?, Error?) -> Void) {
         Lifecycle.queue.async {
             let registry = SurfaceRegistry.shared
-            let surface = extractWallpaperUUID(fromID: id).flatMap { registry.surface(for: $0) }
-                ?? registry.all.first { !$0.isPreview }
+            let requested = extractWallpaperUUID(fromID: id)
+            var surface = requested.flatMap { registry.surface(for: $0) }
+            var match = surface != nil ? "id hit" : (requested == nil ? "no id" : "id miss")
+            if surface == nil {
+                // An unknown surface (e.g. one torn down during display sleep): borrow a
+                // desktop's frame only when every desktop plays the same video, since
+                // displays and Spaces can use different tiles. Otherwise show the
+                // Current Video tile's video and still.
+                let desktops = registry.all.filter { !$0.isPreview }
+                if let first = desktops.first, desktops.allSatisfy({ $0.video.url == first.video.url }) {
+                    surface = first
+                    match += ", every desktop plays the same video"
+                } else {
+                    match += desktops.isEmpty ? ", no desktop" : ", desktops differ → current video"
+                }
+            }
             let store = SharedStateStore.shared
             let pixels = snapshotPixelSize(destSize: surface?.destSize, scale: surface?.scaleFactor)
-            let source = surface?.renderer.currentFrameSource() ?? store.videoURL.map { (url: $0, time: CMTime.zero) }
+            let source = surface?.renderer.currentFrameSource()
+                ?? (surface?.video.url ?? store.videoURL).map { (url: $0, time: CMTime.zero) }
             let gravity = store.state.gravity
-            let thumbnailURL = store.thumbnailURL
+            let thumbnailURL = surface?.stillURL ?? store.thumbnailURL
             let pid = self.connectionPID
             makeVideoSnapshot(source: source, pixelWidth: pixels.width, pixelHeight: pixels.height, gravity: gravity,
                               fallbackImageURL: thumbnailURL) { snapshot, what in
-                extensionLog("=== SNAPSHOT (pid \(pid)) === \(snapshot != nil ? what : "nil")")
+                extensionLog("=== SNAPSHOT (pid \(pid)) === \(match): \(snapshot != nil ? what : "nil")")
                 reply(snapshot, nil)
             }
         }
