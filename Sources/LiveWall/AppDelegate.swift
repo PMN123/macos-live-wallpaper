@@ -28,10 +28,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Put the user's real desktop picture back if the menu-bar effect was running.
-    func applicationWillTerminate(_ notification: Notification) {
-        engine.prepareForTermination()
-    }
-
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 }

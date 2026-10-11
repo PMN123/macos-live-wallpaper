@@ -13,8 +13,9 @@ final class Settings {
         static let muted = "muted"
         static let pauseWhenHidden = "pauseWhenHidden"
         static let pauseOnLowPower = "pauseOnLowPower"
-        static let menuBarWallpaper = "menuBarWallpaper"
         static let gravity = "videoGravity"
+        /// Left behind by the removed menu-bar wallpaper feature.
+        static let legacy = ["menuBarWallpaper", "savedDesktopImages"]
     }
 
     private init() {
@@ -22,9 +23,9 @@ final class Settings {
             Key.muted: true,
             Key.pauseWhenHidden: true,
             Key.pauseOnLowPower: true,
-            Key.menuBarWallpaper: true,
             Key.gravity: AVLayerVideoGravity.resizeAspectFill.rawValue,
         ])
+        Key.legacy.forEach(d.removeObject(forKey:))
     }
 
     var videoURL: URL? {
@@ -61,14 +62,6 @@ final class Settings {
 
     func removeFromLibrary(_ url: URL) {
         library = library.filter { $0.path != url.path }
-    }
-
-    /// When on, live video frames are fed to the system desktop picture so the
-    /// menu bar samples them — making the bar a continuation of the wallpaper.
-    /// When off (or on quit) LiveWall leaves a static still of the video instead.
-    var menuBarWallpaper: Bool {
-        get { d.bool(forKey: Key.menuBarWallpaper) }
-        set { d.set(newValue, forKey: Key.menuBarWallpaper) }
     }
 
     var muted: Bool {

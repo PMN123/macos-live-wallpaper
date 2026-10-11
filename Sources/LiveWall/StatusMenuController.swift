@@ -55,11 +55,18 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             title.isEnabled = false
             menu.addItem(title)
 
+            // Shows the user's intent; a system hold is explained on its own line.
             let playPause = NSMenuItem(
-                title: engine.isPlaying ? "Pause" : "Play",
+                title: engine.userPaused ? "Play" : "Pause",
                 action: #selector(togglePlayPause), keyEquivalent: "p")
             playPause.target = self
             menu.addItem(playPause)
+
+            if !engine.userPaused, let reason = engine.systemPauseDescription {
+                let held = NSMenuItem(title: "Paused: \(reason)", action: nil, keyEquivalent: "")
+                held.isEnabled = false
+                menu.addItem(held)
+            }
         }
 
         let library = NSMenuItem(title: "Video Library…", action: #selector(showLibraryFromMenu), keyEquivalent: "l")
@@ -108,7 +115,6 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
 
         // Toggles
         menu.addItem(toggle("Mute", #selector(toggleMute), on: s.muted))
-        menu.addItem(toggle("Wallpaper in Menu Bar", #selector(toggleMenuBar), on: s.menuBarWallpaper))
         menu.addItem(toggle("Pause When Hidden", #selector(togglePauseWhenHidden), on: s.pauseWhenHidden))
         menu.addItem(toggle("Pause in Low Power Mode", #selector(togglePauseOnLowPower), on: s.pauseOnLowPower))
 
@@ -160,8 +166,6 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     @objc private func togglePlayPause() { engine.togglePlayPause() }
 
     @objc private func toggleMute() { engine.setMuted(!Settings.shared.muted) }
-
-    @objc private func toggleMenuBar() { engine.setMenuBarWallpaper(!Settings.shared.menuBarWallpaper) }
 
     @objc private func setGravity(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String else { return }
