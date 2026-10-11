@@ -14,6 +14,7 @@ final class Settings {
         static let pauseWhenHidden = "pauseWhenHidden"
         static let pauseOnLowPower = "pauseOnLowPower"
         static let gravity = "videoGravity"
+        static let systemWallpaper = "systemWallpaperEnabled"
         /// Left behind by the removed menu-bar wallpaper feature.
         static let legacy = ["menuBarWallpaper", "savedDesktopImages"]
     }
@@ -82,5 +83,14 @@ final class Settings {
     var gravity: AVLayerVideoGravity {
         get { AVLayerVideoGravity(rawValue: d.string(forKey: Key.gravity) ?? "") }
         set { d.set(newValue.rawValue, forKey: Key.gravity) }
+    }
+
+    /// macOS 26+: system wallpaper mode is in use, so LiveWall shares its video with the
+    /// wallpaper extension. Off until the user chooses "Use as System Wallpaper…" or
+    /// picks the LiveWall tile; off again once LiveWall resumes its own window because
+    /// another wallpaper was picked.
+    var systemWallpaperEnabled: Bool {
+        get { d.bool(forKey: Key.systemWallpaper) }
+        set { d.set(newValue, forKey: Key.systemWallpaper) }
     }
 }
