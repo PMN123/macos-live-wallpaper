@@ -6,12 +6,15 @@ import UniformTypeIdentifiers
 /// The menu bar item — the app's entire UI.
 final class StatusMenuController: NSObject, NSMenuDelegate {
     private let engine: WallpaperEngine
+    /// Present on macOS 26 and later only.
+    private let systemWallpaper: SystemWallpaperBridge?
     private let statusItem: NSStatusItem
     private let menu = NSMenu()
     private lazy var libraryWC = LibraryWindowController(engine: engine)
 
-    init(engine: WallpaperEngine) {
+    init(engine: WallpaperEngine, systemWallpaper: SystemWallpaperBridge?) {
         self.engine = engine
+        self.systemWallpaper = systemWallpaper
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
 
@@ -20,7 +23,8 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         }
         menu.delegate = self
         statusItem.menu = menu
-        engine.onStateChange = { [weak self] in self?.rebuildMenu() }
+        engine.addStateObserver { [weak self] in self?.rebuildMenu() }
+        systemWallpaper?.onStatusChange = { [weak self] in self?.rebuildMenu() }
         rebuildMenu()
     }
 
@@ -62,10 +66,33 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
             playPause.target = self
             menu.addItem(playPause)
 
+            // Never while standing down: the system wallpaper has no automatic pauses of
+            // LiveWall's (systemPauseDescription is nil then).
             if !engine.userPaused, let reason = engine.systemPauseDescription {
                 let held = NSMenuItem(title: "Paused: \(reason)", action: nil, keyEquivalent: "")
                 held.isEnabled = false
                 menu.addItem(held)
+            }
+        }
+
+        // System wallpaper mode (macOS 26+): who is drawing the desktop.
+        if let systemWallpaper {
+            let status: String?
+            if systemWallpaper.isExtensionActive {
+                status = "Playing as system wallpaper"
+            } else if engine.isStandingDown {
+                // The extension went quiet; LiveWall's window comes back after a short
+                // grace period unless it reports again.
+                status = "System wallpaper idle"
+            } else if engine.isShowingWindows {
+                status = "Using LiveWall window"
+            } else {
+                status = nil
+            }
+            if let status {
+                let line = NSMenuItem(title: status, action: nil, keyEquivalent: "")
+                line.isEnabled = false
+                menu.addItem(line)
             }
         }
 
@@ -113,16 +140,29 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.addItem(scalingRoot)
         menu.setSubmenu(scalingMenu, for: scalingRoot)
 
-        // Toggles
+        // Toggles. While the system wallpaper plays (engine standing down) macOS alone
+        // decides when it is drawn; the automatic pauses apply only to LiveWall's own
+        // window, so they are shown disabled and say so.
+        let windowOnly = engine.isStandingDown
+        let suffix = windowOnly ? " (LiveWall window only)" : ""
         menu.addItem(toggle("Mute", #selector(toggleMute), on: s.muted))
-        menu.addItem(toggle("Pause When Hidden", #selector(togglePauseWhenHidden), on: s.pauseWhenHidden))
-        menu.addItem(toggle("Pause in Low Power Mode", #selector(togglePauseOnLowPower), on: s.pauseOnLowPower))
+        menu.addItem(toggle("Pause When Hidden" + suffix,
+                            windowOnly ? nil : #selector(togglePauseWhenHidden), on: s.pauseWhenHidden))
+        menu.addItem(toggle("Pause in Low Power Mode" + suffix,
+                            windowOnly ? nil : #selector(togglePauseOnLowPower), on: s.pauseOnLowPower))
 
         menu.addItem(.separator())
 
         let login = toggle("Launch at Login", #selector(toggleLaunchAtLogin),
                            on: SMAppService.mainApp.status == .enabled)
         menu.addItem(login)
+
+        if systemWallpaper != nil {
+            let useSystem = NSMenuItem(title: "Use as System Wallpaper…", action: #selector(useAsSystemWallpaper),
+                                       keyEquivalent: "")
+            useSystem.target = self
+            menu.addItem(useSystem)
+        }
 
         if s.videoURL != nil {
             let stop = NSMenuItem(title: "Remove Wallpaper", action: #selector(stopWallpaper), keyEquivalent: "")
@@ -135,9 +175,12 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
         menu.addItem(quit)
     }
 
-    private func toggle(_ title: String, _ action: Selector, on: Bool) -> NSMenuItem {
+    /// A checkmark item. With no action it is shown disabled (the menu auto-enables
+    /// items, so an action-less item cannot be chosen) but keeps its checkmark.
+    private func toggle(_ title: String, _ action: Selector?, on: Bool) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-        item.target = self
+        item.target = action == nil ? nil : self
+        item.isEnabled = action != nil
         item.state = on ? .on : .off
         return item
     }
@@ -198,4 +241,6 @@ final class StatusMenuController: NSObject, NSMenuDelegate {
     }
 
     @objc private func stopWallpaper() { engine.stop() }
+
+    @objc private func useAsSystemWallpaper() { systemWallpaper?.useAsSystemWallpaper() }
 }

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- pkd refuses unsandboxed com.apple.wallpaper extensions. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <!-- The shared directory the host app writes (state.json, the video clone,
+         thumbnail.png) and the extension logs into. Same key form as Apple's
+         WallpaperAerialsExtension. Both spellings of the parent folder are listed:
+         the volume is case-insensitive, but sandbox path matching may not be, and an
+         existing ~/Library/Application Support/Livewall (lowercase w) folder makes the
+         on-disk path differ from the one LiveWall asks for. -->
+    <key>com.apple.security.temporary-exception.files.home-relative-path.read-write</key>
+    <array>
+        <string>/Library/Application Support/LiveWall/Wallpaper/</string>
+        <string>/Library/Application Support/Livewall/Wallpaper/</string>
+    </array>
+</dict>
+</plist>
