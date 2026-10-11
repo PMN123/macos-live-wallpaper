@@ -7,7 +7,8 @@
 // cache on every Settings launch, re-querying only after a reinstall or OS update.
 // `updateSettingsViewModels` is the host callback that refreshes the cache and updates
 // an open Settings pane in place. The extension pushes once shortly after launch (so a
-// cache from an older build is replaced) and again whenever the tile thumbnail changes.
+// cache from an older build is replaced) and again whenever the tiles change: a video
+// added to or removed from LiveWall's library, a renamed video, or a new still.
 
 import Foundation
 import WallpaperPrivate
@@ -23,10 +24,11 @@ enum SettingsPush {
     private static let lock = NSLock()
     private static var handlers: [WeakHandler] = []
 
-    /// Debounce state and the tile last pushed to every live connection. A single
-    /// connection's provideSettingsViewModels reply does not count. Lifecycle queue only.
+    /// Debounce state and the tiles last pushed to every live connection
+    /// (TileSpec.signature). A single connection's provideSettingsViewModels reply does
+    /// not count. Lifecycle queue only.
     private static var pending: DispatchWorkItem?
-    private static var lastPushedThumbnail: String?
+    private static var lastPushedSignature: String?
 
     static func register(_ handler: WallpaperXPCHandler) {
         lock.lock()
@@ -52,8 +54,8 @@ enum SettingsPush {
         Lifecycle.queue.async { pushNow(force: true) }
     }
 
-    /// Push after a short quiet period, and only if the tile thumbnail changed (a new
-    /// video, or its still arriving). Lifecycle queue.
+    /// Push after a short quiet period, and only if the tiles changed (library videos
+    /// added, removed or renamed, a still arriving). Lifecycle queue.
     static func scheduleRefresh() {
         dispatchPrecondition(condition: .onQueue(Lifecycle.queue))
         pending?.cancel()
@@ -85,19 +87,19 @@ enum SettingsPush {
             extensionLog("[SettingsPush] no live host connection — the cache refreshes on the next query")
             return
         }
-        guard let tile = TileThumbnail.currentURL() else {
+        guard let tiles = currentTileSpecs() else {
             extensionError("[SettingsPush] could not produce the tile thumbnail — nothing pushed")
             return
         }
-        let thumbnail = tile.lastPathComponent
-        if !force, thumbnail == lastPushedThumbnail {
+        let signature = tiles.map(\.signature).joined(separator: "\n")
+        if !force, signature == lastPushedSignature {
             return
         }
-        guard let models = buildSettingsViewModelsXPC(thumbnailURL: tile) else {
+        guard let models = makeSettingsViewModelsXPC(bundleID: settingsProviderBundleID, tiles: tiles) else {
             extensionError("[SettingsPush] build failed — nothing pushed")
             return
         }
-        extensionLog("[SettingsPush] pushing view models (tile \(thumbnail)) to \(proxies.count) connection(s)")
+        extensionLog("[SettingsPush] pushing view models (\(tiles.count) tile(s), current \(tiles[0].thumbnailURL.lastPathComponent)) to \(proxies.count) connection(s)")
         for proxy in proxies {
             proxy.updateSettingsViewModels(models) { error in
                 if let error {
@@ -105,8 +107,8 @@ enum SettingsPush {
                 }
             }
         }
-        lastPushedThumbnail = thumbnail
-        // Every live connection now has this tile; older ones can go.
-        TileThumbnail.removeStale(keeping: thumbnail)
+        lastPushedSignature = signature
+        // Every live connection now has these tiles; older thumbnails can go.
+        TileThumbnail.removeStale(keeping: Set(tiles.map { $0.thumbnailURL.lastPathComponent }))
     }
 }

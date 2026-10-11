@@ -1,23 +1,41 @@
 import AppKit
 import AVFoundation
+import LiveWallShared
 import UniformTypeIdentifiers
 
-/// A small window showing a grid of saved videos. Drop video files anywhere in
-/// it to add them; click one to set it as the wallpaper; click the × on a tile
-/// to remove it from the library.
+/// A small window showing a grid of saved videos. Drop video files or folders anywhere
+/// in it to add them; click one to set it as the wallpaper; click the × on a tile to
+/// remove it from the library. In system wallpaper mode every video here is also a
+/// tile in System Settings › Wallpaper, and the videos macOS is playing are marked.
 final class LibraryWindowController: NSObject, NSWindowDelegate,
                                      NSCollectionViewDataSource, NSCollectionViewDelegate {
     private let engine: WallpaperEngine
+    /// Present on macOS 26 and later only.
+    private let systemWallpaper: SystemWallpaperBridge?
     private var window: NSWindow?
     private var collectionView: NSCollectionView!
     private var emptyLabel: NSTextField!
+    private var hintLabel: NSTextField!
+    private var hintReset: DispatchWorkItem?
     private var urls: [URL] = []
+    /// Library videos whose file is gone (moved, deleted, volume not mounted).
+    private var missing = Set<String>()
+    /// Library videos the system wallpaper is playing.
+    private var onDesktop = Set<String>()
 
     private let itemID = NSUserInterfaceItemIdentifier("LibraryItem")
+    private static let defaultHint = "Drag & drop videos or folders here, then click one to set it as your wallpaper."
 
-    init(engine: WallpaperEngine) {
+    init(engine: WallpaperEngine, systemWallpaper: SystemWallpaperBridge?) {
         self.engine = engine
+        self.systemWallpaper = systemWallpaper
         super.init()
+    }
+
+    /// The system wallpaper's status or what it plays changed.
+    func systemWallpaperStatusChanged() {
+        guard window?.isVisible == true else { return }
+        reload()
     }
 
     // MARK: - Presentation
@@ -42,8 +60,7 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
 
         let container = VideoDropView()
         container.onDrop = { [weak self] urls in
-            Settings.shared.addToLibrary(urls)
-            self?.reload()
+            self?.add(urls)
         }
 
         // Grid
@@ -75,7 +92,7 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
 
         // Empty-state hint
         let empty = NSTextField(labelWithString:
-            "No videos yet.\nDrag & drop video files here, or click “Add Video…”.")
+            "No videos yet.\nDrag & drop videos or a folder of videos here, or click “Add Video…”.")
         empty.translatesAutoresizingMaskIntoConstraints = false
         empty.alignment = .center
         empty.maximumNumberOfLines = 0
@@ -95,12 +112,19 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
         addButton.translatesAutoresizingMaskIntoConstraints = false
         bar.addSubview(addButton)
 
-        let hint = NSTextField(labelWithString: "Drag & drop videos here, then click one to set it as your wallpaper.")
+        let addFolderButton = NSButton(title: "Add Folder…", target: self, action: #selector(addFolderClicked))
+        addFolderButton.bezelStyle = .rounded
+        addFolderButton.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(addFolderButton)
+
+        let hint = NSTextField(labelWithString: Self.defaultHint)
         hint.translatesAutoresizingMaskIntoConstraints = false
         hint.textColor = .secondaryLabelColor
         hint.font = .systemFont(ofSize: 11)
         hint.lineBreakMode = .byTruncatingTail
+        hint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         bar.addSubview(hint)
+        hintLabel = hint
 
         container.addSubview(bar)
 
@@ -123,7 +147,10 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
             addButton.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 14),
             addButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
 
-            hint.leadingAnchor.constraint(equalTo: addButton.trailingAnchor, constant: 14),
+            addFolderButton.leadingAnchor.constraint(equalTo: addButton.trailingAnchor, constant: 8),
+            addFolderButton.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
+
+            hint.leadingAnchor.constraint(equalTo: addFolderButton.trailingAnchor, constant: 14),
             hint.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -14),
             hint.centerYAnchor.constraint(equalTo: bar.centerYAnchor),
         ])
@@ -135,7 +162,11 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
     // MARK: - Data
 
     private func reload() {
-        urls = Settings.shared.library.filter { FileManager.default.fileExists(atPath: $0.path) }
+        // Videos whose file is gone stay listed (dimmed) so they can be removed: in
+        // system wallpaper mode their tile keeps playing LiveWall's copy until then.
+        urls = Settings.shared.library
+        missing = Set(urls.map(\.path).filter { !FileManager.default.fileExists(atPath: $0) })
+        onDesktop = systemWallpaper?.libraryPathsPlayedBySystem() ?? []
         collectionView?.reloadData()
         emptyLabel?.isHidden = !urls.isEmpty
     }
@@ -145,6 +176,34 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
         reload()
     }
 
+    /// Add videos (folders contribute the videos directly inside them).
+    private func add(_ dropped: [URL]) {
+        let videos = Self.expandMovieURLs(dropped)
+        guard !videos.isEmpty else {
+            flashHint("No videos found there.")
+            return
+        }
+        let added = Settings.shared.addToLibrary(videos)
+        reload()
+        if videos.count > 1 || added == 0 {
+            flashHint(added == 0 ? "Already in the library." : "Added \(added) video\(added == 1 ? "" : "s").")
+        }
+    }
+
+    /// Show `text` in the bottom bar for a few seconds.
+    private func flashHint(_ text: String, seconds: TimeInterval = 4) {
+        guard let hintLabel else { return }
+        hintReset?.cancel()
+        hintLabel.stringValue = text
+        hintLabel.textColor = .labelColor
+        let work = DispatchWorkItem { [weak self] in
+            self?.hintLabel?.stringValue = Self.defaultHint
+            self?.hintLabel?.textColor = .secondaryLabelColor
+        }
+        hintReset = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
     @objc private func addClicked() {
         let panel = NSOpenPanel()
         panel.title = "Add Videos"
@@ -152,17 +211,60 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         if panel.runModal() == .OK {
-            Settings.shared.addToLibrary(panel.urls)
-            reload()
+            add(panel.urls)
         }
     }
 
-    static func movieURLs(from info: NSDraggingInfo) -> [URL] {
-        let options: [NSPasteboard.ReadingOptionKey: Any] = [
-            .urlReadingFileURLsOnly: true,
-            .urlReadingContentsConformToTypes: [UTType.movie.identifier],
-        ]
+    @objc private func addFolderClicked() {
+        let panel = NSOpenPanel()
+        panel.title = "Add Folders of Videos"
+        panel.message = "LiveWall adds the videos directly inside each folder you choose."
+        panel.prompt = "Add"
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        if panel.runModal() == .OK {
+            add(panel.urls)
+        }
+    }
+
+    /// The file URLs being dragged: videos and folders (expanded on drop).
+    static func droppedFileURLs(from info: NSDraggingInfo) -> [URL] {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
         return info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL] ?? []
+    }
+
+    /// Whether a drag carries something worth adding. Cheap: folders are not listed
+    /// until the drop.
+    static func canAccept(_ info: NSDraggingInfo) -> Bool {
+        droppedFileURLs(from: info).contains { isMovie($0) || isFolder($0) }
+    }
+
+    /// Videos among `urls`, with each folder replaced by the videos directly inside it
+    /// (by name, hidden files skipped).
+    static func expandMovieURLs(_ urls: [URL]) -> [URL] {
+        var result: [URL] = []
+        for url in urls {
+            if isFolder(url) {
+                let children = (try? FileManager.default.contentsOfDirectory(
+                    at: url, includingPropertiesForKeys: [.contentTypeKey], options: [.skipsHiddenFiles])) ?? []
+                result += children.filter(isMovie).sorted {
+                    $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+                }
+            } else if isMovie(url) {
+                result.append(url)
+            }
+        }
+        return result
+    }
+
+    private static func isMovie(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.conforms(to: .movie) == true
+    }
+
+    private static func isFolder(_ url: URL) -> Bool {
+        guard let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]) else { return false }
+        return values.isDirectory == true && values.isPackage != true
     }
 
     // MARK: - NSCollectionViewDataSource
@@ -175,7 +277,8 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
                         itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
         let item = collectionView.makeItem(withIdentifier: itemID, for: indexPath) as! LibraryCollectionViewItem
         let url = urls[indexPath.item]
-        item.configure(url: url, isCurrent: url.path == Settings.shared.videoURL?.path)
+        item.configure(url: url, isCurrent: url.path == Settings.shared.videoURL?.path,
+                       isMissing: missing.contains(url.path), isOnDesktop: onDesktop.contains(url.path))
         item.onDelete = { [weak self] in self?.remove(url) }
         return item
     }
@@ -184,22 +287,31 @@ final class LibraryWindowController: NSObject, NSWindowDelegate,
 
     func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
         guard let ip = indexPaths.first, ip.item < urls.count else { return }
-        engine.load(url: urls[ip.item])
+        let url = urls[ip.item]
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            NSSound.beep()
+            collectionView.deselectItems(at: indexPaths)
+            flashHint("“\(url.lastPathComponent)” is missing. Remove it with ×, or add it again from its new place.", seconds: 6)
+            return
+        }
+        engine.load(url: url)
+        if systemWallpaper?.shouldHintFixedTiles() == true {
+            flashHint("Every desktop uses a fixed video tile, so picks here change only the “Current Video” tile in System Settings › Wallpaper.", seconds: 8)
+        }
         DispatchQueue.main.async { [weak self] in self?.reload() } // refresh the "current" ring
     }
 
     func collectionView(_ collectionView: NSCollectionView, validateDrop draggingInfo: NSDraggingInfo,
                         proposedIndexPath: AutoreleasingUnsafeMutablePointer<NSIndexPath>,
                         dropOperation proposedDropOperation: UnsafeMutablePointer<NSCollectionView.DropOperation>) -> NSDragOperation {
-        Self.movieURLs(from: draggingInfo).isEmpty ? [] : .copy
+        Self.canAccept(draggingInfo) ? .copy : []
     }
 
     func collectionView(_ collectionView: NSCollectionView, acceptDrop draggingInfo: NSDraggingInfo,
                         indexPath: IndexPath, dropOperation: NSCollectionView.DropOperation) -> Bool {
-        let dropped = Self.movieURLs(from: draggingInfo)
-        guard !dropped.isEmpty else { return false }
-        Settings.shared.addToLibrary(dropped)
-        reload()
+        let dropped = Self.droppedFileURLs(from: draggingInfo)
+        guard Self.canAccept(draggingInfo) else { return false }
+        add(dropped)
         return true
     }
 
@@ -223,13 +335,12 @@ final class VideoDropView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        LibraryWindowController.movieURLs(from: sender).isEmpty ? [] : .copy
+        LibraryWindowController.canAccept(sender) ? .copy : []
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let urls = LibraryWindowController.movieURLs(from: sender)
-        guard !urls.isEmpty else { return false }
-        onDrop?(urls)
+        guard LibraryWindowController.canAccept(sender) else { return false }
+        onDrop?(LibraryWindowController.droppedFileURLs(from: sender))
         return true
     }
 }
@@ -239,6 +350,8 @@ final class LibraryCollectionViewItem: NSCollectionViewItem {
     private let thumb = NSImageView()
     private let nameLabel = NSTextField(labelWithString: "")
     private let deleteButton = NSButton()
+    /// "On Desktop": the system wallpaper plays this video.
+    private let badge = NSTextField(labelWithString: "On Desktop")
     private var url: URL?
     var onDelete: (() -> Void)?
 
@@ -277,6 +390,18 @@ final class LibraryCollectionViewItem: NSCollectionViewItem {
         deleteButton.toolTip = "Remove from library"
         root.addSubview(deleteButton)
 
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.font = .systemFont(ofSize: 10, weight: .semibold)
+        badge.textColor = .white
+        badge.alignment = .center
+        badge.wantsLayer = true
+        badge.layer?.cornerRadius = 4
+        badge.layer?.masksToBounds = true
+        badge.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.6).cgColor
+        badge.toolTip = "macOS is playing this video as the system wallpaper"
+        badge.isHidden = true
+        root.addSubview(badge)
+
         NSLayoutConstraint.activate([
             thumb.topAnchor.constraint(equalTo: root.topAnchor, constant: 8),
             thumb.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
@@ -292,16 +417,26 @@ final class LibraryCollectionViewItem: NSCollectionViewItem {
             deleteButton.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -3),
             deleteButton.widthAnchor.constraint(equalToConstant: 20),
             deleteButton.heightAnchor.constraint(equalToConstant: 20),
+
+            badge.leadingAnchor.constraint(equalTo: thumb.leadingAnchor, constant: 5),
+            badge.bottomAnchor.constraint(equalTo: thumb.bottomAnchor, constant: -5),
+            badge.widthAnchor.constraint(equalToConstant: 72),
         ])
 
         view = root
     }
 
-    func configure(url: URL, isCurrent: Bool) {
+    func configure(url: URL, isCurrent: Bool, isMissing: Bool = false, isOnDesktop: Bool = false) {
         self.url = url
-        nameLabel.stringValue = url.deletingPathExtension().lastPathComponent
+        let name = SharedVideoNames.displayName(forFileName: url.lastPathComponent)
+        nameLabel.stringValue = isMissing ? "\(name) (missing)" : name
+        nameLabel.textColor = isMissing ? .secondaryLabelColor : .labelColor
+        view.toolTip = isMissing ? "File not found: \(url.path)" : url.lastPathComponent
+        thumb.alphaValue = isMissing ? 0.4 : 1
+        badge.isHidden = !isOnDesktop
         setCurrent(isCurrent)
         thumb.image = nil
+        guard !isMissing else { return }
         ThumbnailCache.shared.thumbnail(for: url) { [weak self] image in
             guard let self, self.url == url else { return }
             self.thumb.image = image

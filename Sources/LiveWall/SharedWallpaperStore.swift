@@ -1,6 +1,4 @@
-import AVFoundation
 import Foundation
-import ImageIO
 import LiveWallShared
 import notify
 
@@ -271,46 +269,12 @@ final class SharedWallpaperStore {
     /// A still at about 1 s, at most 640 px on its longest side, as thumbnail.png.
     @discardableResult
     private func writeThumbnail(for videoURL: URL) -> Bool {
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: videoURL))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = CGSize(width: 640, height: 640)
-        let tolerance = CMTime(value: 1, timescale: 2)
-        generator.requestedTimeToleranceBefore = tolerance
-        generator.requestedTimeToleranceAfter = tolerance
-
-        var image = Self.generateImage(generator, at: CMTime(value: 1, timescale: 1))
-        if image == nil {
-            image = Self.generateImage(generator, at: .zero) // clips shorter than a second
-        }
-        guard let image else {
+        guard VideoStill.writePNG(for: videoURL, to: thumbnailURL) else {
             try? FileManager.default.removeItem(at: thumbnailURL)
             log("could not make a thumbnail for \(videoURL.lastPathComponent)")
             return false
         }
-        let partial = directory.appendingPathComponent(".\(SharedWallpaper.thumbnailFileName).partial")
-        guard let destination = CGImageDestinationCreateWithURL(partial as CFURL, "public.png" as CFString, 1, nil) else { return false }
-        CGImageDestinationAddImage(destination, image, nil)
-        guard CGImageDestinationFinalize(destination), rename(partial.path, thumbnailURL.path) == 0 else {
-            try? FileManager.default.removeItem(at: partial)
-            log("could not write \(SharedWallpaper.thumbnailFileName)")
-            return false
-        }
         return true
-    }
-
-    private final class ImageBox {
-        var image: CGImage?
-    }
-
-    private static func generateImage(_ generator: AVAssetImageGenerator, at time: CMTime) -> CGImage? {
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = ImageBox()
-        generator.generateCGImageAsynchronously(for: time) { image, _, _ in
-            box.image = image
-            semaphore.signal()
-        }
-        guard semaphore.wait(timeout: .now() + 15) == .success else { return nil }
-        return box.image
     }
 
     // MARK: - Cleanup (queue)

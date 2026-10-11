@@ -3,93 +3,143 @@
 // Adapted from Phosphene (https://github.com/kageroumado/phosphene), MIT License, © 2026 kageroumado
 // Source: PhospheneExtension/SettingsProvider.swift at commit db03edf. See THIRD_PARTY_NOTICES.md.
 //
-// One group ("LiveWall") with one tile ("LiveWall") whose choice configuration is the
-// UTF-8 bytes "current": the tile always means "whatever LiveWall is playing", and the
-// video itself is chosen in the LiveWall app. Its thumbnail is a copy of the host's
-// thumbnail.png (or generated art when there is none).
+// One group ("LiveWall"). Its first tile, "Current Video", has the choice configuration
+// "current" (UTF-8 bytes): it always means "whatever LiveWall is playing", chosen in the
+// LiveWall app, as the single "LiveWall" tile did before. Then one tile per video of
+// LiveWall's Video Library (library.json), whose configuration is the entry's id: that
+// tile keeps its video whatever LiveWall's menu picks. Thumbnails are copies of the
+// host's stills in the extension container (SettingsTiles.swift), or generated art.
 // Never serve an empty group: on macOS 26.6 the agent caches this response on disk and
 // reuses it on every Settings launch, so a cached empty group hides the section until a
-// reinstall or OS update (Phosphene issue #27).
+// reinstall or OS update (Phosphene issue #27). The Current Video tile is always there.
+//
+// This file is the pure part (no container or shared-directory access), so it can be
+// checked against the real WallpaperSettingsViewModelsXPC on its own.
 
 import Foundation
 import LiveWallShared
 
 enum LiveWallChoice {
-    static let currentID = "current"
+    static let currentID = SharedChoice.current
     static let groupID = "livewall"
     static let contextMenuInfoID = "livewall-info"
+    static let libraryMenuInfoID = "livewall-library-info"
 }
 
-/// Build the settings view models and remap them to WallpaperSettingsViewModelsXPC.
-/// Lifecycle queue (the tile thumbnail may be copied). `thumbnailURL` defaults to the
-/// current tile.
-@available(macOS 26.0, *)
-func buildSettingsViewModelsXPC(thumbnailURL: URL? = nil) -> AnyObject? {
-    let bundleID = Bundle.main.bundleIdentifier ?? SharedWallpaper.extensionBundleID
-    guard let thumbnailURL = thumbnailURL ?? TileThumbnail.currentURL() else {
-        extensionError("  [Settings] could not produce the tile thumbnail")
-        return nil
+/// One tile of the LiveWall group.
+struct TileSpec: Equatable {
+    /// The choice configuration: "current" or a library entry id.
+    var configuration: String
+    /// The label under the tile, and the only name the pane shows for it.
+    var title: String
+    /// The choice descriptor's name. The macOS 26.6 agent type does not keep it (checked
+    /// by archiving the real WallpaperSettingsViewModelsXPC); sent for older shapes.
+    var choiceName: String
+    var description: String
+    var thumbnailURL: URL
+    var contextMenuTitle: String
+
+    /// Changes whenever the agent's copy of this tile would be out of date.
+    var signature: String {
+        "\(configuration)|\(title)|\(thumbnailURL.lastPathComponent)"
     }
-    return makeSettingsViewModelsXPC(bundleID: bundleID, thumbnailURL: thumbnailURL)
 }
 
-/// The view models for a given provider id and tile thumbnail (separate so the
-/// archive/remap path can be exercised without touching the container).
-func makeSettingsViewModelsXPC(bundleID: String, thumbnailURL: URL) -> AnyObject? {
-    let menu = ContextMenu(items: [
+/// The tiles: Current Video first, then each library video in library order.
+func makeTileSpecs(currentThumbnail: URL, library: [SharedLibraryEntry],
+                   thumbnail: (SharedLibraryEntry) -> URL) -> [TileSpec] {
+    var tiles = [TileSpec(
+        configuration: LiveWallChoice.currentID,
+        title: "Current Video",
+        choiceName: "LiveWall \u{2014} Current Video",
+        description: "The video playing in LiveWall",
+        thumbnailURL: currentThumbnail,
+        contextMenuTitle: "Choose the video in LiveWall\u{2019}s menu"
+    )]
+    var seen: Set<String> = [LiveWallChoice.currentID]
+    for entry in library where seen.insert(entry.id).inserted {
+        tiles.append(TileSpec(
+            configuration: entry.id,
+            title: entry.name,
+            choiceName: entry.name,
+            description: "From LiveWall\u{2019}s Video Library",
+            thumbnailURL: thumbnail(entry),
+            contextMenuTitle: "Add or remove videos in LiveWall\u{2019}s Video Library"
+        ))
+    }
+    return tiles
+}
+
+/// The view models for a provider id and its tiles, remapped to
+/// WallpaperSettingsViewModelsXPC. Nil when there are no tiles (never an empty group).
+func makeSettingsViewModelsXPC(bundleID: String, tiles: [TileSpec]) -> AnyObject? {
+    guard let viewModels = makeSettingsViewModels(bundleID: bundleID, tiles: tiles) else { return nil }
+    return remapToRealXPC(viewModels)
+}
+
+func makeSettingsViewModels(bundleID: String, tiles: [TileSpec]) -> SettingsViewModels? {
+    guard !tiles.isEmpty else { return nil } // never serve an empty group
+    let provider = ChoiceProviderID(rawValue: bundleID)
+
+    let items = tiles.enumerated().map { index, tile -> SettingsItem in
+        let menuID = tile.configuration == LiveWallChoice.currentID
+            ? LiveWallChoice.contextMenuInfoID : LiveWallChoice.libraryMenuInfoID
+        let menu = ContextMenu(items: [
+            ContextMenuItem(id: ContextMenuItemID(id: menuID), localizedTitle: tile.contextMenuTitle, isDestructive: false),
+        ])
+        let choiceID = ChoiceID(
+            id: tile.configuration,
+            descriptor: ChoiceIDDescriptor(
+                provider: provider,
+                identifier: tile.configuration,
+                files: [],
+                configuration: Data(tile.configuration.utf8)
+            )
+        )
+        return SettingsItem(
+            id: choiceID,
+            localizedName: tile.title,
+            thumbnail: .image(url: tile.thumbnailURL),
+            choice: ChoiceDescriptor(
+                id: choiceID,
+                provider: provider,
+                identifier: tile.configuration,
+                name: tile.choiceName,
+                localizedDescription: tile.description,
+                thumbnail: .image(url: tile.thumbnailURL),
+                isDownloaded: true,
+                options: []
+            ),
+            contentBadge: .video,
+            showInTopLevel: true,
+            sortOrder: index,
+            // Not `.removable`: the pane force-unwraps a removable item's choiceRequest,
+            // which a provider tile does not have (Phosphene). Videos are removed in
+            // LiveWall's Video Library instead.
+            disposability: .none,
+            contextMenu: menu
+        )
+    }
+
+    let groupMenu = ContextMenu(items: [
         ContextMenuItem(
-            id: ContextMenuItemID(id: LiveWallChoice.contextMenuInfoID),
-            localizedTitle: "Choose the video in LiveWall\u{2019}s menu",
+            id: ContextMenuItemID(id: LiveWallChoice.libraryMenuInfoID),
+            localizedTitle: "Add or remove videos in LiveWall\u{2019}s Video Library",
             isDestructive: false
         ),
     ])
-
-    let choiceID = ChoiceID(
-        id: LiveWallChoice.currentID,
-        descriptor: ChoiceIDDescriptor(
-            provider: ChoiceProviderID(rawValue: bundleID),
-            identifier: LiveWallChoice.currentID,
-            files: [],
-            configuration: Data(LiveWallChoice.currentID.utf8)
-        )
-    )
-
-    let item = SettingsItem(
-        id: choiceID,
-        localizedName: "LiveWall",
-        thumbnail: .image(url: thumbnailURL),
-        choice: ChoiceDescriptor(
-            id: choiceID,
-            provider: ChoiceProviderID(rawValue: bundleID),
-            identifier: LiveWallChoice.currentID,
-            name: "LiveWall",
-            localizedDescription: "The video playing in LiveWall",
-            thumbnail: .image(url: thumbnailURL),
-            isDownloaded: true,
-            options: []
-        ),
-        contentBadge: .video,
-        showInTopLevel: true,
-        sortOrder: 0,
-        // Not `.removable`: the pane force-unwraps a removable item's choiceRequest,
-        // which a provider tile does not have (Phosphene).
-        disposability: .none,
-        contextMenu: menu
-    )
-
     let group = SettingsGroup(
         id: GroupID(id: LiveWallChoice.groupID),
-        items: [item],
+        items: items,
         localizedName: "LiveWall",
         disposability: .none,
         sortOrder: -100,
         sortID: GroupSortID(id: "com.apple.wallpaper.aerials"),
         allChoiceID: nil,
         shouldHideItemLabels: false,
-        contextMenu: menu,
+        contextMenu: groupMenu,
         thumbnail: nil
     )
-    guard !group.items.isEmpty else { return nil } // never serve an empty group
 
     let viewModel = SettingsViewModel(groups: [group], refreshPolicy: .default, isModificationDisabled: false)
     // Desktop picker only. A surface in idle presentation holds its frame (see
@@ -98,80 +148,7 @@ func makeSettingsViewModelsXPC(bundleID: String, thumbnailURL: URL) -> AnyObject
     // saver apart from someone else's. Offered in the Screen Saver picker too (as
     // Phosphene does, telling the two apart by reading the wallpaper store), LiveWall as
     // the screen saver would show a frozen frame.
-    return remapToRealXPC(SettingsViewModels(desktop: viewModel, screenSaver: nil))
-}
-
-/// The tile thumbnail lives in the extension container's Documents directory, which
-/// WallpaperAgent and the Settings pane are known to read (M1). It is a copy of the
-/// host's thumbnail.png named after the video and file stamp, so a new video gets a new
-/// URL and the agent's cached view model cannot keep showing the old still.
-///
-/// Serving a tile never deletes older ones: the agent's cache and other connections may
-/// still point at them. They are removed only after a push has sent every live
-/// connection the current one (SettingsPush).
-@available(macOS 26.0, *)
-enum TileThumbnail {
-    private static let prefix = "livewall-tile-"
-    private static let defaultName = "livewall-tile-default.png"
-    /// Left behind by milestone M1.
-    private static let legacyNames = ["livewall-m1-tile.png"]
-
-    /// The URL to serve now. Lifecycle queue.
-    static func currentURL() -> URL? {
-        let fm = FileManager.default
-        let docs = fm.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
-        do {
-            try fm.createDirectory(at: docs, withIntermediateDirectories: true)
-        } catch {
-            extensionError("  [Tile] could not create \(docs.path): \(error.localizedDescription)")
-            return nil
-        }
-
-        let store = SharedStateStore.shared
-        var chosen: URL?
-        if let key = store.thumbnailKey {
-            let url = docs.appendingPathComponent("\(prefix)\(sanitized(key)).png")
-            if fm.fileExists(atPath: url.path) {
-                chosen = url
-            } else if let image = loadImage(at: store.thumbnailURL, maxPixelSize: 640) {
-                // Re-encoded rather than copied byte for byte: only a decodable image
-                // reaches the agent.
-                if writePNGAtomically(image, to: url) {
-                    chosen = url
-                } else {
-                    extensionError("  [Tile] could not write \(url.lastPathComponent)")
-                }
-            }
-        }
-        if chosen == nil {
-            let url = docs.appendingPathComponent(defaultName)
-            if fm.fileExists(atPath: url.path) {
-                chosen = url
-            } else if let art = FallbackArt.image(width: 480, height: 270), writePNGAtomically(art, to: url) {
-                chosen = url
-            }
-        }
-        return chosen
-    }
-
-    /// Delete every tile but `keep` (and the default art). Lifecycle queue.
-    static func removeStale(keeping keep: String) {
-        let docs = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents", isDirectory: true)
-        removeStale(in: docs, keeping: keep)
-    }
-
-    private static func sanitized(_ key: String) -> String {
-        String(key.unicodeScalars.map { CharacterSet.alphanumerics.contains($0) || $0 == "-" ? Character($0) : "_" })
-    }
-
-    private static func removeStale(in docs: URL, keeping keep: String) {
-        let fm = FileManager.default
-        guard let names = try? fm.contentsOfDirectory(atPath: docs.path) else { return }
-        for name in names where name != keep && name != defaultName
-            && ((name.hasPrefix(prefix) && name.hasSuffix(".png")) || legacyNames.contains(name)) {
-            try? fm.removeItem(at: docs.appendingPathComponent(name))
-        }
-    }
+    return SettingsViewModels(desktop: viewModel, screenSaver: nil)
 }
 
 /// Archive via LiveWallShimViewModelsXPC and decode the archive as the real private

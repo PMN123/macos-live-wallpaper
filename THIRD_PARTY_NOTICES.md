@@ -25,6 +25,7 @@ sources. Each file says so in its header comment.
 | `Sources/LiveWallWallpaper/LoopRetimer.swift` | `PhospheneExtension/VideoRenderer.swift` |
 | `Sources/LiveWallWallpaper/StillImages.swift` | `PhospheneExtension/StillFrame.swift`, `PhospheneExtension/SnapshotCreation.swift` |
 | `Sources/LiveWallWallpaper/SettingsProvider.swift` | `PhospheneExtension/SettingsProvider.swift` |
+| `Sources/LiveWallWallpaper/SettingsTiles.swift` | `PhospheneExtension/SettingsProvider.swift` |
 | `Sources/LiveWallWallpaper/CodableShims.swift` | `PhospheneExtension/CodableShims.swift` |
 | `Sources/LiveWallWallpaper/SettingsPush.swift` | `PhospheneExtension/SettingsPush.swift` |
 
